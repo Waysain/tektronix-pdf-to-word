@@ -90,7 +90,10 @@ def parse_pdf(path):
         for line in page_text.splitlines():
             nums = re.findall(r"-\s*\d+(?:\.\d+)?(?=dB)", line)
             if len(nums) >= 3:
-                rows.append([abs(float(x.replace(" ", ""))) for x in nums[:3]])
+                rows.append([
+                    abs(Decimal(x.replace(" ", "").replace(",", ".")))
+                    for x in nums[:3]
+                ])
         if len(rows) < 9:
             raise ValueError("Не удалось извлечь 9 строк затухания отражения ({})".format(title))
         if title == "приёмник":
@@ -174,42 +177,86 @@ def parse_10baset_pdf(path):
 
 
 # ----------------------------------------------------------------------------
-# 1000BASE-T (Парсинг для таблиц)
+# 1000BASE-T (Парсинг по примеру return loss из 100)
 # ----------------------------------------------------------------------------
 def parse_1000baset_pdf(path, label):
+    """Извлекает только три столбца Measured Value (85/100/115 Ohm).
+
+    В этих PDF PyMuPDF возвращает заголовки/Spec. Value отдельно от строк
+    измерений, поэтому извлечение выполняется по координатам слов на странице.
+    """
     pdf = fitz.open(path)
-    if len(pdf) < 1:
-        raise ValueError("Пустой PDF-файл.")
-    text = pdf[0].get_text("text")
-    
-    # Ищем все значения вида -16.00dB
-    # В таблице 11 строк по 4 значения (Spec + 3 измерения) = 44 значения
-    db_values = re.findall(r"([-\u2212]\s*\d+(?:[.,]\d+)?)\s*dB", text, re.I)
-    
-    if len(db_values) < 44:
-        raise ValueError(f"1000BASE-T ({label}): не удалось найти 44 значения dB (найдено {len(db_values)}).")
-    
-    rows = []
-    # Обрабатываем первые 44 значения, разбивая их по 4 штуки на строку
-    for i in range(0, 44, 4):
-        try:
-            # Пропускаем db_values[i] (это Spec. Value)
-            # Извлекаем три значения (85, 100, 115 Ом)
-            vals = []
-            for j in range(1, 4):
-                num_match = re.search(r"\d+(?:[.,]\d+)?", db_values[i+j])
-                if num_match:
-                    vals.append(abs(float(num_match.group().replace(",", "."))))
-            
-            if len(vals) == 3:
-                rows.append(vals)
-        except Exception:
-            continue
-            
-    if len(rows) < 11:
-        raise ValueError(f"1000BASE-T ({label}): удалось извлечь только {len(rows)} строк из 11.")
-    
-    return [[round_text(x, 1) for x in row] for row in rows[:11]]
+    try:
+        if len(pdf) < 1:
+            raise ValueError("Пустой PDF-файл.")
+
+        page = pdf[0]
+        words = page.get_text("words")
+        measured_header = [
+            w for w in words
+            if w[4].strip().lower() == "measured"
+        ]
+        if not measured_header:
+            raise ValueError(
+                "Не найден заголовок «Measured Value» в PDF."
+            )
+
+        header_y = min(w[1] for w in measured_header)
+
+        # В таблице три колонки измерений находятся правее Spec. Value.
+        # Берём числовые dB-значения только ниже заголовка Measured Value.
+        db_re = re.compile(r"^[-−]\s*\d+(?:[.,]\d+)?\s*dB;?$", re.I)
+        measured_words = []
+        for w in words:
+            x0, y0, x1, y1, token = w[:5]
+            token = token.strip()
+            if y0 <= header_y + 15:
+                continue
+            if x0 < 255 or x0 > 500:
+                continue
+            if not db_re.match(token):
+                continue
+            measured_words.append((float(y0), float(x0), token))
+
+        if not measured_words:
+            raise ValueError("Не найдены значения в столбцах Measured Value.")
+
+        # Сгруппировать значения одной строки по вертикальной координате.
+        measured_words.sort(key=lambda item: (item[0], item[1]))
+        row_groups = []
+        row_tolerance = 3.0
+        for y, x, token in measured_words:
+            if not row_groups or abs(y - row_groups[-1]["y"]) > row_tolerance:
+                row_groups.append({"y": y, "items": [(x, token)]})
+            else:
+                group = row_groups[-1]
+                group["items"].append((x, token))
+
+        rows = []
+        for group in row_groups:
+            items = sorted(group["items"], key=lambda item: item[0])
+            # Не принимаем строку, если в ней нет ровно трёх measured-значений.
+            if len(items) != 3:
+                continue
+            values_row = []
+            for _, token in items:
+                numeric = re.search(r"[-−]\s*(\d+(?:[.,]\d+)?)", token)
+                if not numeric:
+                    raise ValueError("Не удалось разобрать значение: " + token)
+                amount = Decimal(numeric.group(1).replace(",", "."))
+                values_row.append(round_text(amount, 1))
+            rows.append(values_row)
+
+        if len(rows) != 11:
+            raise ValueError(
+                "1000BASE-T ({}): найдено {} строк Measured Value из 11; "
+                "в каждой строке должно быть по 3 значения (85/100/115 Ом)."
+                .format(label, len(rows))
+            )
+
+        return rows
+    finally:
+        pdf.close()
 
 
 # ----------------------------------------------------------------------------
@@ -263,36 +310,39 @@ def fill_10baset_docx(doc, v):
 
 
 # ----------------------------------------------------------------------------
-# Заполнение Word — 1000BASE-T (ИСПРАВЛЕНО)
+# Заполнение Word — 1000BASE-T (BI_DA / BI_DB)
 # ----------------------------------------------------------------------------
 def fill_1000baset_docx(doc, v_a, v_b):
     errors = []
     try:
-        # Ищем таблицы по пункту СТБ 7.6.4.8
         rl_1000 = find_tables(doc, "7.6.4.8", ("частота",))
         if len(rl_1000) < 2:
-            # Резервный поиск только по номеру пункта
             rl_1000 = find_tables(doc, "7.6.4.8")
         
         if len(rl_1000) < 2:
             raise ValueError("В Word-форме не найдены 2 таблицы для 1000BASE-T (пункт 7.6.4.8).")
         
-        # Сортируем таблицы, чтобы Порт A был первым
-        tables_a = [t for t in rl_1000 if "порт a" in table_text(t) or "port a" in table_text(t)]
-        tables_b = [t for t in rl_1000 if "порт b" in table_text(t) or "port b" in table_text(t)]
+        # Ищем таблицы по меткам BI_DA и BI_DB
+        tables_a = [t for t in rl_1000 if "bi_da" in table_text(t)]
+        tables_b = [t for t in rl_1000 if "bi_db" in table_text(t)]
+        
+        # Резервный поиск по "Порт A" / "Порт B", если BI_DA/BI_DB не найдены
+        if not (tables_a and tables_b):
+            tables_a = [t for t in rl_1000 if "порт a" in table_text(t) or "port a" in table_text(t)]
+            tables_b = [t for t in rl_1000 if "порт b" in table_text(t) or "port b" in table_text(t)]
         
         if tables_a and tables_b:
             rl_1000 = [tables_a[0], tables_b[0]]
         else:
-            rl_1000 = rl_1000[:2] # Берем первые две найденные
+            rl_1000 = rl_1000[:2]
 
         for table_obj, values_matrix in zip(rl_1000, [v_a, v_b]):
             if not values_matrix:
                 continue
             row = 3 # Начинаем с первой строки данных
             for freq_row in values_matrix:
-                # Для каждой частоты перебираем 3 значения (85, 100, 115 Ом)
-                # и пишем их в один и тот же столбец (индекс 2), но в разные строки
+                # Записываем 3 значения (85, 100, 115) в столбец 2 (Результат измерения)
+                # и инкрементируем строку для каждого сопротивления
                 for value in freq_row:
                     put(table_obj, row, 2, value)
                     row += 1
