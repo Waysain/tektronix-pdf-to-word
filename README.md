@@ -4,3 +4,4 @@
   pip install -r requirements.txt
   python main.py
 
+Исправлено некорректное заполнение таблиц в 1000

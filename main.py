@@ -174,7 +174,7 @@ def parse_10baset_pdf(path):
 
 
 # ----------------------------------------------------------------------------
-# 1000BASE-T (Улучшенный парсинг для таблиц)
+# 1000BASE-T (Парсинг для таблиц)
 # ----------------------------------------------------------------------------
 def parse_1000baset_pdf(path, label):
     pdf = fitz.open(path)
@@ -182,7 +182,7 @@ def parse_1000baset_pdf(path, label):
         raise ValueError("Пустой PDF-файл.")
     text = pdf[0].get_text("text")
     
-    # Ищем все значения вида -16.00dB или −16.00dB (учитывая возможные пробелы и спецсимволы)
+    # Ищем все значения вида -16.00dB
     # В таблице 11 строк по 4 значения (Spec + 3 измерения) = 44 значения
     db_values = re.findall(r"([-\u2212]\s*\d+(?:[.,]\d+)?)\s*dB", text, re.I)
     
@@ -263,7 +263,7 @@ def fill_10baset_docx(doc, v):
 
 
 # ----------------------------------------------------------------------------
-# Заполнение Word — 1000BASE-T (Поиск по 7.6.4.8)
+# Заполнение Word — 1000BASE-T (ИСПРАВЛЕНО)
 # ----------------------------------------------------------------------------
 def fill_1000baset_docx(doc, v_a, v_b):
     errors = []
@@ -277,7 +277,7 @@ def fill_1000baset_docx(doc, v_a, v_b):
         if len(rl_1000) < 2:
             raise ValueError("В Word-форме не найдены 2 таблицы для 1000BASE-T (пункт 7.6.4.8).")
         
-        # Сортируем таблицы, чтобы Порт A был первым, если в тексте есть "порт a" или "port a"
+        # Сортируем таблицы, чтобы Порт A был первым
         tables_a = [t for t in rl_1000 if "порт a" in table_text(t) or "port a" in table_text(t)]
         tables_b = [t for t in rl_1000 if "порт b" in table_text(t) or "port b" in table_text(t)]
         
@@ -289,11 +289,13 @@ def fill_1000baset_docx(doc, v_a, v_b):
         for table_obj, values_matrix in zip(rl_1000, [v_a, v_b]):
             if not values_matrix:
                 continue
-            row = 3
+            row = 3 # Начинаем с первой строки данных
             for freq_row in values_matrix:
-                for ci, value in enumerate(freq_row):
-                    put(table_obj, row, 2 + ci, value)
-                row += 1
+                # Для каждой частоты перебираем 3 значения (85, 100, 115 Ом)
+                # и пишем их в один и тот же столбец (индекс 2), но в разные строки
+                for value in freq_row:
+                    put(table_obj, row, 2, value)
+                    row += 1
     except Exception as exc:
         errors.append("1000BASE-T: " + str(exc))
     return errors
